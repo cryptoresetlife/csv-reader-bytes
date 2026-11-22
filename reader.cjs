@@ -873,6 +873,7 @@ function answerFile(inPath, outPath, cap = MAXCAP, close = true) {
 /** The program: /input/cases.json to /output/answers.json (MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in). */
 function main() {
   answerFile((process.env.MAKEFUN_INPUT_DIR ?? '/input') + '/cases.json', (process.env.MAKEFUN_OUTPUT_DIR ?? '/output') + '/answers.json', MAXCAP, false);
+  process.exit(0); // every byte is written: nothing is left for Node to wind down
 }
 
 module.exports = { answerFile, main };
