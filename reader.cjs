@@ -31,18 +31,14 @@ const CODES = ['stray_cr', 'quote_junk', 'unterminated_quote', 'short_row', 'lon
 const OPEN_HEADER = '{"columns":             ';
 const OPEN_PLAIN = '{"columns":null,"rows":[';
 
-/** 1 for the bytes that end a run of plain field bytes: the comma, the backslash and the quote that ends the text. */
-const STOP = new Uint8Array(256);
-STOP[44] = 1;
-STOP[92] = 1;
-STOP[34] = 1;
-
 let IFD = -1; // the input and output files; below 0 the input is SRC and the output goes nowhere (prime)
 let OFD = -1;
 let SRC = null;
 let SRCPOS = 0;
 let INP = null; // the input window, CAP bytes and 16 of guard
 let OUT = null; // the output not yet written
+let INPV = null; // the same two as words
+let OUTV = null;
 let ERR = null; // the case's errors, five numbers each
 let EXT = null; // the case's long rows' cut fields, as JSON
 let CAP = 0;
@@ -94,6 +90,7 @@ function room(n) {
   const bigger = new Uint8Array((O + n) * 2);
   bigger.set(OUT.subarray(0, O));
   OUT = bigger;
+  OUTV = new DataView(OUT.buffer);
 }
 
 /** Moves INP[keep..END) to the window's start and reads on. False when the file has nothing more to give. */
@@ -110,9 +107,11 @@ function refill(keep) {
     const wider = new Uint8Array(CAP + 16);
     wider.set(INP.subarray(0, tail));
     INP = wider;
+    INPV = new DataView(INP.buffer);
     const out = new Uint8Array(HIGH + 3 * CAP + 64);
     out.set(OUT.subarray(0, O));
     OUT = out;
+    OUTV = new DataView(OUT.buffer);
   }
   let n = 0;
   if (IFD >= 0) n = readSync(IFD, INP, tail, CAP - tail, null);
@@ -263,7 +262,8 @@ function odd(nf, ri, ro, recLine) {
 function readText() {
   const a = INP;
   const b = OUT;
-  const stop = STOP;
+  const av = INPV;
+  const bv = OUTV;
   const end = END;
   const lim = LIM;
   const high = HIGH;
@@ -282,6 +282,13 @@ function readText() {
   let d = 0;
   let nf = 0;
   let t = 0;
+  let w = 0; // four input bytes as one word
+  let x = 0;
+  let y = 0;
+  let z = 0;
+  let m = 0; // a word with bit 7 of a byte set where the input word holds a byte that stops the copy
+  let k = 0; // how many of the four bytes come before the first that stops it
+  let base = 0;
 
   rec: for (;;) {
     // a record starts here: what a window's end takes the reader back to
@@ -323,13 +330,61 @@ function readText() {
     o += 2;
     nf = 0;
     for (;;) {
-      // a field starts here, its opening quote written; t says how it ends
-      c = a[i];
-      if (c === 92 && a[i + 1] === 34) {
-        if (i >= lim) {
+      // A plain stretch: field bytes and commas up to the next backslash or quote, four bytes at a time. Each
+      // turn copies a whole word; when none of its bytes is a comma, a backslash or a quote it moves on by
+      // four, else by the bytes before the first of them (m marks them: the zero bytes of the word XORed with
+      // each, found the usual way; only its lowest mark is used, which is always a true one) and, when that
+      // is a comma, writes "," and goes on. The bytes written past o are rewritten by what follows. Every
+      // comma moves the output two bytes further than the input: that counts them.
+      base = o - i;
+      for (;;) {
+        w = av.getInt32(i, true);
+        x = w ^ 0x2c2c2c2c;
+        y = w ^ 0x5c5c5c5c;
+        z = w ^ 0x22222222;
+        m = (((x - 0x01010101) & ~x) | ((y - 0x01010101) & ~y) | ((z - 0x01010101) & ~z)) & 0x80808080;
+        bv.setInt32(o, w, true);
+        if (m === 0) {
+          i += 4;
+          o += 4;
+          continue;
+        }
+        k = (31 - Math.clz32(m & -m)) >> 3;
+        i += k;
+        o += k;
+        c = a[i];
+        if (c !== 44) break;
+        bv.setInt32(o, 0x222c22, true);
+        o += 3;
+        i++;
+      }
+      nf += (o - i - base) >> 1;
+      if (c === 34) {
+        if (i >= end) {
           st = 1;
           break rec;
         }
+        t = 3;
+        break;
+      }
+      if (i >= lim) {
+        st = 1;
+        break rec;
+      }
+      d = a[i + 1];
+      if (d === 110) {
+        i += 2;
+        t = 2;
+        break;
+      }
+      if (d === 114 && a[i + 2] === 92 && a[i + 3] === 110) {
+        i += 4;
+        t = 2;
+        break;
+      }
+      if (d === 34 && (i === ri || a[i - 1] === 44)) {
+        // a quote where a field starts: a quoted field, copied up to a backslash or a quote (a byte at a time:
+        // a second word loop costs more to compile than it saves on the few bytes that are quoted)
         const qi = i;
         const qo = o;
         const qline = line;
@@ -431,39 +486,12 @@ function readText() {
           break rec;
         }
       } else {
-        while (stop[c] === 0) {
-          b[o++] = c;
-          c = a[++i];
-        }
-        if (c === 44) {
-          i++;
-          t = 1;
-        } else if (c === 92) {
-          if (i >= lim) {
-            st = 1;
-            break rec;
-          }
-          d = a[i + 1];
-          if (d === 110) {
-            i += 2;
-            t = 2;
-          } else if (d === 114 && a[i + 2] === 92 && a[i + 3] === 110) {
-            i += 4;
-            t = 2;
-          } else {
-            I = i;
-            O = o;
-            t = rest(rline, nrec, -1);
-            i = I;
-            o = O;
-          }
-        } else {
-          if (i >= end) {
-            st = 1;
-            break rec;
-          }
-          t = 3;
-        }
+        // a stray CR, a quote inside a field, or a byte this reader does not read
+        I = i;
+        O = o;
+        t = rest(rline, nrec, -1);
+        i = I;
+        o = O;
       }
       if (t !== 1) break;
       b[o] = 34;
@@ -543,7 +571,8 @@ function patch(at, s) {
 function put(s) {
   const n = s.length;
   room(n);
-  for (let k = 0; k < n; k++) OUT[O + k] = s.charCodeAt(k);
+  if (n < 16) for (let k = 0; k < n; k++) OUT[O + k] = s.charCodeAt(k);
+  else Buffer.from(OUT.buffer).latin1Write(s, O, n);
   O += n;
 }
 
@@ -556,6 +585,8 @@ function transduce(cap) {
   HIGH = cap;
   INP = new Uint8Array(CAP + 16);
   OUT = new Uint8Array(HIGH + 3 * CAP + 64);
+  INPV = new DataView(INP.buffer);
+  OUTV = new DataView(OUT.buffer);
   ERR = new Int32Array(5 * 4096);
   EXT = new Uint8Array(1 << 16);
   END = 0;
@@ -622,25 +653,25 @@ function transduce(cap) {
           OUT[O - 1] = 93;
         }
       }
-      put(',"errors":[');
+      // the errors, as one string as far as they are ASCII: only a long row's cut fields are copied as bytes
+      let s = ',"errors":[';
       for (let e = 0; e < NERR; e += 5) {
         const code = ERR[e];
         const k = ERR[e + 2];
         const row = header ? (k === 0 ? 'null' : String(k - 1)) : String(k);
-        const s = (e > 0 ? ',{"code":"' : '{"code":"') + CODES[code] + '","line":' + ERR[e + 1] + ',"row":' + row;
-        if (code === E_SHORT) put(s + ',"fields":' + ERR[e + 3] + '}');
+        s += (e > 0 ? ',{"code":"' : '{"code":"') + CODES[code] + '","line":' + ERR[e + 1] + ',"row":' + row;
+        if (code === E_SHORT) s += ',"fields":' + ERR[e + 3] + '}';
         else if (code === E_LONG) {
           put(s + ',"extra":[');
           const at = ERR[e + 3];
           const len = ERR[e + 4];
-          room(len + 2);
+          room(len);
           OUT.set(EXT.subarray(at, at + len), O);
           O += len;
-          OUT[O++] = 93;
-          OUT[O++] = 125;
-        } else put(s + '}');
+          s = ']}';
+        } else s += '}';
       }
-      put(']}');
+      put(s + ']}');
 
       ensure(2);
       const c = INP[I++];
@@ -667,10 +698,10 @@ function transduce(cap) {
 function primer() {
   const q = '\\"';
   const rows = [];
-  for (let r = 0; r < 6; r++) {
+  for (let r = 1; r < 5; r++) {
     const eol = r % 3 === 0 ? '\\n' : '\\r\\n';
-    rows.push(`${r},alpha beta,2020-01-0${r % 9},AB-12${r},${q}say ${q}${q}hi${q}${q}, you${q},x${eol}`);
-    rows.push(`${r},gamma,${q}two${eol}lines\\rmore${q},CD-9,${q}plain${q},y${eol}`);
+    rows.push(`${r},alpha beta,2020-01-0${r},AB-12${r},${q}say ${q}${q}hi${q}${q}, you${q},x${eol}`);
+    rows.push(`${r},Zürich 東京,${q}two${eol}lines\\rmore${q},CD-9,${q}plain${q},y${eol}`);
     if (r % 5 === 1) rows.push(`1,short${eol}`);
     if (r % 5 === 2) rows.push(`1,2,3,4,5,6,long,${q}lo,ng${q},er${eol}`);
     if (r % 5 === 3) rows.push(`1,a\\rb,${q}q${q}kg,${q}q${q}\\r,x${q}y,${q}z${q}${eol}${eol}\\r${eol}`);
@@ -702,13 +733,21 @@ const FLAGS = ['--no-lazy-feedback-allocation', '--turbo-filter=readText', '--no
 /** Runs the reader over the primer, then has V8 compile readText before its next call. */
 function prime() {
   PRIMED = true;
-  const { setFlagsFromString } = require('node:v8');
-  for (const f of FLAGS) setFlagsFromString(f);
+  let v8;
+  try {
+    // V8's flag setter straight from Node's binding: loading node:v8 for it costs over a millisecond
+    process.noDeprecation = true;
+    v8 = process.binding('v8');
+    if (typeof v8.setFlagsFromString !== 'function') v8 = require('node:v8');
+  } catch {
+    v8 = require('node:v8');
+  }
+  for (const f of FLAGS) v8.setFlagsFromString(f);
   IFD = -1;
   OFD = -1;
   SRC = primer();
   SRCPOS = 0;
-  transduce(64);
+  transduce(256);
   SRC = null;
   try {
     new Function('f', '%OptimizeFunctionOnNextCall(f)')(readText);
@@ -718,7 +757,7 @@ function prime() {
 }
 
 /** Answers every case of the file at inPath into outPath. True when the byte reader did, false when run() had to. */
-function answerFile(inPath, outPath, cap = 1 << 18) {
+function answerFile(inPath, outPath, cap = 1 << 18, close = true) {
   let ok = false;
   try {
     if (!PRIMED) prime();
@@ -728,6 +767,7 @@ function answerFile(inPath, outPath, cap = 1 << 18) {
   } catch {
     ok = false;
   }
+  if (ok && !close) return true; // the program's own run: the files close as it exits
   if (IFD >= 0) closeSync(IFD);
   if (OFD >= 0) closeSync(OFD);
   IFD = -1;
@@ -744,7 +784,7 @@ function answerFile(inPath, outPath, cap = 1 << 18) {
 
 /** The program: /input/cases.json to /output/answers.json (MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in). */
 function main() {
-  answerFile((process.env.MAKEFUN_INPUT_DIR ?? '/input') + '/cases.json', (process.env.MAKEFUN_OUTPUT_DIR ?? '/output') + '/answers.json');
+  answerFile((process.env.MAKEFUN_INPUT_DIR ?? '/input') + '/cases.json', (process.env.MAKEFUN_OUTPUT_DIR ?? '/output') + '/answers.json', 1 << 18, false);
 }
 
 module.exports = { answerFile, main };
