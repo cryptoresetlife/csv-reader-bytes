@@ -3,552 +3,712 @@
 // The file is read through a small window as bytes, and each case's answer is written as JSON bytes while its text
 // is still JSON-escaped. A CSV quote is the two bytes \" there, a line feed \n, a carriage return \r, and every other
 // byte of a field is copied as it stands, so no string is ever decoded or encoded. Anything this reader does not
-// expect (another escape, another layout of the file) sends the whole file to solve.js's run() instead, the plain
-// drop-in, so the answer is the same either way.
+// expect (another escape, another layout of the file, a record or an error list too large for its fixed memory)
+// sends the whole file to solve.js's run() instead, the plain drop-in, so the answer is the same either way.
 //
-// readText is the one hot function: it reads the records that are as most are (plain and quoted fields, commas,
-// line breaks, quoted line breaks and doubled quotes) and hands every rare thing to a function of its own (rest:
-// the rest of a field with a stray CR, a literal quote or characters after a closing quote; odd: the first record,
-// a short, a long or an empty one), so the optimizing compiler has little to compile. Before the file is opened the
-// reader is run once over a few made-up cases held in memory (prime), which takes it through every branch, so the
-// compiler knows every branch's types and compiles readText once, before the first real byte.
+// The reading itself is Records below, written in the asm.js subset of JavaScript: whole numbers and one ArrayBuffer,
+// nothing else. It is ordinary JavaScript and runs as such anywhere; an engine that knows the subset (V8 does)
+// compiles it ahead of its first call, with no warm-up and no type guessing to undo. The rest of this file is the
+// driver around it: the window, the files, each case's opening and closing bytes and its list of errors.
 //
-// Pure JavaScript, no dependency, nothing kept from one case to the next. CommonJS, since that is what Node starts
-// fastest.
-
-'use strict';
+// Plain JavaScript source, no dependency, nothing kept from one case to the next. CommonJS, since that is what Node
+// starts fastest.
 
 const { openSync, closeSync, readSync, writeSync, readFileSync, writeFileSync } = require('node:fs');
 
-const E_STRAY_CR = 0;
-const E_QUOTE_JUNK = 1;
-const E_UNTERMINATED = 2;
-const E_SHORT = 3;
-const E_LONG = 4;
-/** How each error opens in the answer, by its code, as bytes: a comma (the first error's is cut) and up to its line. */
-const ERR_OPEN = ['stray_cr', 'quote_junk', 'unterminated_quote', 'short_row', 'long_row'].map((code) => Buffer.from(`,{"code":"${code}","line":`, 'latin1'));
-const ERR_ROW = Buffer.from(',"row":', 'latin1');
-const ERR_NULL = Buffer.from('null', 'latin1');
-const ERR_FIELDS = Buffer.from(',"fields":', 'latin1');
-const ERR_EXTRA = Buffer.from(',"extra":[', 'latin1');
+// The one ArrayBuffer (4 MiB), by byte offset:
+//        0  sixteen 32-bit numbers, the reader's state (the S_ indexes below)
+//       64  the ready-made texts of an error (TEXTS): for each, where it is and how long, then the texts
+//   IB      the input window: at most MAXCAP bytes of the file and 16 of guard
+//   OB      the output not yet written: HIGH bytes before it is written out, and room for one window's records
+//   EB      the case's errors, five 32-bit numbers each: code, line, record count, and two more for a short row's
+//           fields or a long row's cut fields (where they are kept, and how many bytes)
+//   XB      the case's long rows' cut fields, as the JSON they were written as
+const HEAP_BYTES = 1 << 22;
+const TB = 64;
+const IB = 512;
+const MAXCAP = 1 << 18;
+const OB = 1 << 19;
+const OEND = OB + MAXCAP + 3 * MAXCAP + 64;
+const EB = 1 << 21;
+const XB = 3 << 20;
+
+const S_I = 0; // the next input byte
+const S_O = 1; // the next output byte
+const S_END = 2; // the window holds the bytes before END
+const S_LIM = 3; // an escape at or past LIM may be cut by the window's end
+const S_LINE = 4;
+const S_NREC = 5; // the case's records so far
+const S_WIDTH = 6;
+const S_NERR = 7; // the 32-bit numbers the case's errors take so far
+const S_NEXT = 8; // the bytes the case's cut fields take so far
+const S_HIGH = 9; // the output is written out once it passes HIGH
+const S_OEND = 10; // where the output's room ends
+const S_BAD = 11; // set when the fixed memory is too small for the case: run() answers the file
+
+/**
+ * The records of a case's text, read from the window and written as JSON arrays. stdlib is the global object,
+ * foreign the two functions it calls out to, heap the ArrayBuffer above.
+ */
+function Records(stdlib, foreign, heap) {
+  'use asm';
+  var H8 = new stdlib.Uint8Array(heap);
+  var H32 = new stdlib.Int32Array(heap);
+  var flush = foreign.flush; // writes the output out up to an offset; the offset to go on from
+  var first = foreign.first; // told where the case's first record ends
+
+  // One more error: its code (0 stray_cr, 1 quote_junk, 2 unterminated_quote, 3 short_row, 4 long_row), the line
+  // its record starts on, the records before it, and two numbers more.
+  function pushErr(code, line, k, a, b) {
+    code = code | 0;
+    line = line | 0;
+    k = k | 0;
+    a = a | 0;
+    b = b | 0;
+    var n = 0;
+    var p = 0;
+    n = H32[7] | 0;
+    if ((n | 0) > 262000) {
+      H32[11] = 1;
+      return;
+    }
+    p = (2097152 + (n << 2)) | 0;
+    H32[p >> 2] = code;
+    H32[(p + 4) >> 2] = line;
+    H32[(p + 8) >> 2] = k;
+    H32[(p + 12) >> 2] = a;
+    H32[(p + 16) >> 2] = b;
+    H32[7] = (n + 5) | 0;
+  }
+
+  // The rest of an unquoted field, with everything rare in it: a stray CR, a literal quote, and from the output
+  // offset `junk` on (when it is not below 0) the characters after a closing quote. How it ended: 1 at a comma,
+  // 2 at a line break (both read), 3 at the text's end (not read), 4 at the window's end, 5 at a byte this reader
+  // does not read.
+  function rest(recLine, k, junk) {
+    recLine = recLine | 0;
+    k = k | 0;
+    junk = junk | 0;
+    var i = 0;
+    var o = 0;
+    var t = 0;
+    var c = 0;
+    var d = 0;
+    var end = 0;
+    var lim = 0;
+    i = H32[0] | 0;
+    o = H32[1] | 0;
+    end = H32[2] | 0;
+    lim = H32[3] | 0;
+    for (;;) {
+      c = H8[i >> 0] | 0;
+      if ((c | 0) == 44) {
+        i = (i + 1) | 0;
+        t = 1;
+        break;
+      }
+      if ((c | 0) == 92) {
+        if ((i | 0) >= (lim | 0)) {
+          t = 4;
+          break;
+        }
+        d = H8[(i + 1) >> 0] | 0;
+        if ((d | 0) == 110) {
+          i = (i + 2) | 0;
+          t = 2;
+          break;
+        }
+        if ((d | 0) == 114) {
+          if (((H8[(i + 2) >> 0] | 0) == 92) & ((H8[(i + 3) >> 0] | 0) == 110)) {
+            i = (i + 4) | 0;
+            t = 2;
+            break;
+          }
+          pushErr(0, recLine, k, 0, 0);
+          i = (i + 2) | 0;
+          continue;
+        }
+        if ((d | 0) == 34) {
+          H8[o >> 0] = 92;
+          H8[(o + 1) >> 0] = 34;
+          o = (o + 2) | 0;
+          i = (i + 2) | 0;
+          continue;
+        }
+        t = 5;
+        break;
+      }
+      if ((c | 0) == 34) {
+        if ((i | 0) >= (end | 0)) t = 4;
+        else t = 3;
+        break;
+      }
+      H8[o >> 0] = c;
+      o = (o + 1) | 0;
+      i = (i + 1) | 0;
+    }
+    if ((t | 0) < 4) {
+      if ((junk | 0) >= 0) {
+        if ((o | 0) > (junk | 0)) pushErr(1, recLine, k, 0, 0);
+      }
+    }
+    H32[0] = i;
+    H32[1] = o;
+    return t | 0;
+  }
+
+  // The end of a record that is not a row of the case's width with two fields or more: the first record, a short
+  // or a long row, a record of one field, a line with no characters or with stray CRs alone, the text's end. The
+  // output holds it from `ro` as [ "..." , "..." with its last quote written; `ri` is where it began in the window.
+  function odd(nf, ri, ro, recLine) {
+    nf = nf | 0;
+    ri = ri | 0;
+    ro = ro | 0;
+    recLine = recLine | 0;
+    var o = 0;
+    var total = 0;
+    var width = 0;
+    var nrec = 0;
+    var k = 0;
+    var p = 0;
+    var c = 0;
+    var len = 0;
+    var nx = 0;
+    var q = 0;
+    var pad = 0;
+    o = H32[1] | 0;
+    nrec = H32[5] | 0;
+    width = H32[6] | 0;
+    total = (nf + 1) | 0;
+    if (((nf | 0) == 0) & ((o | 0) == ((ro + 3) | 0))) {
+      if (!(((H8[ri >> 0] | 0) == 92) & ((H8[(ri + 1) >> 0] | 0) == 34))) {
+        H32[1] = ro; // no characters and no quotes: no record
+        return;
+      }
+    }
+    if ((width | 0) < 0) {
+      H32[6] = total;
+      H32[5] = 1;
+      H8[o >> 0] = 93;
+      o = (o + 1) | 0;
+      first(o | 0);
+      // ,"rows":[
+      H8[o >> 0] = 44;
+      H8[(o + 1) >> 0] = 34;
+      H8[(o + 2) >> 0] = 114;
+      H8[(o + 3) >> 0] = 111;
+      H8[(o + 4) >> 0] = 119;
+      H8[(o + 5) >> 0] = 115;
+      H8[(o + 6) >> 0] = 34;
+      H8[(o + 7) >> 0] = 58;
+      H8[(o + 8) >> 0] = 91;
+      H32[1] = (o + 9) | 0;
+      return;
+    }
+    if ((total | 0) < (width | 0)) {
+      pushErr(3, recLine, nrec, total, 0);
+      if ((width | 0) > 300000) {
+        H32[11] = 1;
+        return;
+      }
+      pad = (((width - total) | 0) * 3) | 0;
+      if (((o + pad + 8) | 0) > (H32[10] | 0)) {
+        o = flush(o | 0) | 0;
+        if (((o + pad + 8) | 0) > (H32[10] | 0)) {
+          H32[11] = 1;
+          H32[1] = o;
+          return;
+        }
+      }
+      for (k = total; (k | 0) < (width | 0); k = (k + 1) | 0) {
+        H8[o >> 0] = 44;
+        H8[(o + 1) >> 0] = 34;
+        H8[(o + 2) >> 0] = 34;
+        o = (o + 3) | 0;
+      }
+    } else if ((total | 0) > (width | 0)) {
+      // the comma after the last field kept: `width` strings on from the record's first quote
+      p = (ro + 1) | 0;
+      for (k = 0; (k | 0) < (width | 0); k = (k + 1) | 0) {
+        p = (p + 1) | 0;
+        for (;;) {
+          c = H8[p >> 0] | 0;
+          if ((c | 0) == 34) break;
+          if ((c | 0) == 92) p = (p + 2) | 0;
+          else p = (p + 1) | 0;
+        }
+        p = (p + 2) | 0;
+      }
+      p = (p - 1) | 0;
+      len = (o - p - 1) | 0;
+      nx = H32[8] | 0;
+      if ((len | 0) > ((1048576 - nx) | 0)) {
+        H32[11] = 1;
+        return;
+      }
+      q = (3145728 + nx) | 0;
+      for (k = 0; (k | 0) < (len | 0); k = (k + 1) | 0) H8[(q + k) >> 0] = H8[(p + 1 + k) >> 0] | 0;
+      pushErr(4, recLine, nrec, nx, len);
+      H32[8] = (nx + len) | 0;
+      o = p;
+    }
+    H8[o >> 0] = 93;
+    H8[(o + 1) >> 0] = 44;
+    H32[1] = (o + 2) | 0;
+    H32[5] = (nrec + 1) | 0;
+  }
+
+  // Reads the text's records from the window on, writing each as a JSON array. 0: the text ended (the next input
+  // byte is past its closing quote); 1: the window ended inside a record (the next input byte is back at the
+  // record's start, and nothing of the record is kept); 2: this reader does not read the file.
+  function readText() {
+    var i = 0;
+    var o = 0;
+    var end = 0;
+    var lim = 0;
+    var high = 0;
+    var line = 0;
+    var nrec = 0;
+    var width = 0;
+    var st = 0;
+    var ri = 0;
+    var ro = 0;
+    var rline = 0;
+    var rnerr = 0;
+    var rnext = 0;
+    var c = 0;
+    var d = 0;
+    var nf = 0;
+    var t = 0;
+    var qi = 0;
+    var qo = 0;
+    var qline = 0;
+    i = H32[0] | 0;
+    o = H32[1] | 0;
+    end = H32[2] | 0;
+    lim = H32[3] | 0;
+    line = H32[4] | 0;
+    nrec = H32[5] | 0;
+    width = H32[6] | 0;
+    high = H32[9] | 0;
+
+    rec: for (;;) {
+      // a record starts here: what a window's end takes the reader back to
+      if ((o | 0) > (high | 0)) o = flush(o | 0) | 0;
+      ri = i;
+      ro = o;
+      rline = line;
+      rnerr = H32[7] | 0;
+      rnext = H32[8] | 0;
+      H8[o >> 0] = 91;
+      H8[(o + 1) >> 0] = 34;
+      o = (o + 2) | 0;
+      nf = 0;
+      for (;;) {
+        // plain bytes up to a comma, a backslash or the quote that ends the text
+        c = H8[i >> 0] | 0;
+        while (((c | 0) != 44) & ((c | 0) != 92) & ((c | 0) != 34)) {
+          H8[o >> 0] = c;
+          o = (o + 1) | 0;
+          i = (i + 1) | 0;
+          c = H8[i >> 0] | 0;
+        }
+        if ((c | 0) == 44) {
+          H8[o >> 0] = 34;
+          H8[(o + 1) >> 0] = 44;
+          H8[(o + 2) >> 0] = 34;
+          o = (o + 3) | 0;
+          i = (i + 1) | 0;
+          nf = (nf + 1) | 0;
+          continue;
+        }
+        if ((c | 0) == 34) {
+          if ((i | 0) >= (end | 0)) {
+            st = 1;
+            break rec;
+          }
+          t = 3;
+          break;
+        }
+        if ((i | 0) >= (lim | 0)) {
+          st = 1;
+          break rec;
+        }
+        d = H8[(i + 1) >> 0] | 0;
+        if ((d | 0) == 110) {
+          i = (i + 2) | 0;
+          t = 2;
+          break;
+        }
+        if (((d | 0) == 114) & ((H8[(i + 2) >> 0] | 0) == 92) & ((H8[(i + 3) >> 0] | 0) == 110)) {
+          i = (i + 4) | 0;
+          t = 2;
+          break;
+        }
+        if (((d | 0) == 34) & (((i | 0) == (ri | 0)) | ((H8[(i - 1) >> 0] | 0) == 44))) {
+          // a quote where a field starts: a quoted field, copied up to a backslash or a quote
+          qi = i;
+          qo = o;
+          qline = line;
+          i = (i + 2) | 0;
+          for (;;) {
+            c = H8[i >> 0] | 0;
+            while (((c | 0) != 92) & ((c | 0) != 34)) {
+              H8[o >> 0] = c;
+              o = (o + 1) | 0;
+              i = (i + 1) | 0;
+              c = H8[i >> 0] | 0;
+            }
+            if ((c | 0) == 34) {
+              if ((i | 0) >= (end | 0)) {
+                st = 1;
+                break rec;
+              }
+              // the text ends inside the quotes: the quote is a character, and the field is read again from it
+              line = qline;
+              pushErr(2, rline, nrec, 0, 0);
+              H8[qo >> 0] = 92;
+              H8[(qo + 1) >> 0] = 34;
+              H32[0] = (qi + 2) | 0;
+              H32[1] = (qo + 2) | 0;
+              t = rest(rline, nrec, -1) | 0;
+              i = H32[0] | 0;
+              o = H32[1] | 0;
+              break;
+            }
+            if ((i | 0) >= (lim | 0)) {
+              st = 1;
+              break rec;
+            }
+            d = H8[(i + 1) >> 0] | 0;
+            if ((d | 0) == 34) {
+              if (((H8[(i + 2) >> 0] | 0) == 92) & ((H8[(i + 3) >> 0] | 0) == 34)) {
+                H8[o >> 0] = 92;
+                H8[(o + 1) >> 0] = 34;
+                o = (o + 2) | 0;
+                i = (i + 4) | 0;
+                continue;
+              }
+              // the closing quote
+              i = (i + 2) | 0;
+              c = H8[i >> 0] | 0;
+              if ((c | 0) == 44) {
+                i = (i + 1) | 0;
+                t = 1;
+                break;
+              }
+              if ((c | 0) == 92) {
+                if ((i | 0) >= (lim | 0)) {
+                  st = 1;
+                  break rec;
+                }
+                d = H8[(i + 1) >> 0] | 0;
+                if ((d | 0) == 110) {
+                  i = (i + 2) | 0;
+                  t = 2;
+                  break;
+                }
+                if (((d | 0) == 114) & ((H8[(i + 2) >> 0] | 0) == 92) & ((H8[(i + 3) >> 0] | 0) == 110)) {
+                  i = (i + 4) | 0;
+                  t = 2;
+                  break;
+                }
+              } else if ((c | 0) == 34) {
+                if ((i | 0) >= (end | 0)) {
+                  st = 1;
+                  break rec;
+                }
+                t = 3;
+                break;
+              }
+              H32[0] = i;
+              H32[1] = o;
+              t = rest(rline, nrec, o) | 0;
+              i = H32[0] | 0;
+              o = H32[1] | 0;
+              break;
+            }
+            if ((d | 0) == 110) {
+              H8[o >> 0] = 92;
+              H8[(o + 1) >> 0] = 110;
+              o = (o + 2) | 0;
+              i = (i + 2) | 0;
+              line = (line + 1) | 0;
+              continue;
+            }
+            if ((d | 0) == 114) {
+              H8[o >> 0] = 92;
+              H8[(o + 1) >> 0] = 110;
+              o = (o + 2) | 0;
+              if (((H8[(i + 2) >> 0] | 0) == 92) & ((H8[(i + 3) >> 0] | 0) == 110)) i = (i + 4) | 0;
+              else i = (i + 2) | 0;
+              line = (line + 1) | 0;
+              continue;
+            }
+            st = 2;
+            break rec;
+          }
+        } else {
+          // a stray CR, a quote inside a field, or a byte this reader does not read
+          H32[0] = i;
+          H32[1] = o;
+          t = rest(rline, nrec, -1) | 0;
+          i = H32[0] | 0;
+          o = H32[1] | 0;
+        }
+        if ((t | 0) != 1) break;
+        H8[o >> 0] = 34;
+        H8[(o + 1) >> 0] = 44;
+        H8[(o + 2) >> 0] = 34;
+        o = (o + 3) | 0;
+        nf = (nf + 1) | 0;
+      }
+      if ((t | 0) > 3) {
+        st = (t - 3) | 0;
+        break;
+      }
+      H8[o >> 0] = 34;
+      o = (o + 1) | 0;
+      if ((t | 0) == 2) line = (line + 1) | 0;
+      if ((((nf + 1) | 0) == (width | 0)) & ((nf | 0) != 0)) {
+        H8[o >> 0] = 93;
+        H8[(o + 1) >> 0] = 44;
+        o = (o + 2) | 0;
+        nrec = (nrec + 1) | 0;
+      } else {
+        H32[1] = o;
+        H32[5] = nrec;
+        H32[6] = width;
+        odd(nf, ri, ro, rline);
+        o = H32[1] | 0;
+        nrec = H32[5] | 0;
+        width = H32[6] | 0;
+      }
+      if (H32[11] | 0) {
+        st = 2;
+        break;
+      }
+      if ((t | 0) == 3) {
+        i = (i + 1) | 0; // the quote that ends the text
+        break;
+      }
+    }
+
+    if ((st | 0) == 0) {
+      H32[0] = i;
+      H32[1] = o;
+      H32[4] = line;
+    } else {
+      H32[0] = ri;
+      H32[1] = ro;
+      H32[4] = rline;
+      H32[7] = rnerr;
+      H32[8] = rnext;
+    }
+    H32[5] = nrec;
+    H32[6] = width;
+    return st | 0;
+  }
+
+  // Writes v, a whole number of 0 or more, in decimal at output offset o; the offset after it.
+  function num(v, o) {
+    v = v | 0;
+    o = o | 0;
+    var n = 0;
+    var p = 0;
+    var q = 0;
+    if ((v | 0) < 10) {
+      H8[o >> 0] = (48 + v) | 0;
+      return (o + 1) | 0;
+    }
+    n = 2;
+    p = 100;
+    while ((p | 0) <= (v | 0)) {
+      n = (n + 1) | 0;
+      if ((n | 0) == 10) break;
+      p = (p * 10) | 0;
+    }
+    for (q = (o + n - 1) | 0; (q | 0) >= (o | 0); q = (q - 1) | 0) {
+      H8[q >> 0] = (48 + ((v | 0) % 10)) | 0;
+      v = ((v | 0) / 10) | 0;
+    }
+    return (o + n) | 0;
+  }
+
+  // Copies ready-made text number t (the table at byte 64: where it is and how long) to output offset o; the
+  // offset after it.
+  function text(o, t) {
+    o = o | 0;
+    t = t | 0;
+    var p = 0;
+    var n = 0;
+    var k = 0;
+    p = H32[(64 + (t << 3)) >> 2] | 0;
+    n = H32[(68 + (t << 3)) >> 2] | 0;
+    for (k = 0; (k | 0) < (n | 0); k = (k + 1) | 0) H8[(o + k) >> 0] = H8[(p + k) >> 0] | 0;
+    return (o + n) | 0;
+  }
+
+  // Writes the case's errors as a JSON array: each from its code's ready-made opening (texts 0 to 4), its numbers
+  // digit by digit, a long row's cut fields as they were kept. `header` is 1 when the case's header is true: a
+  // record's row is then one less than the records before it, and null for the first.
+  function putErrors(header) {
+    header = header | 0;
+    var o = 0;
+    var e = 0;
+    var count = 0;
+    var at = 0;
+    var code = 0;
+    var k = 0;
+    var oend = 0;
+    var from = 0;
+    var len = 0;
+    var j = 0;
+    o = H32[1] | 0;
+    count = H32[7] | 0;
+    oend = H32[10] | 0;
+    if ((count | 0) == 0) {
+      H8[o >> 0] = 91;
+      o = (o + 1) | 0;
+    }
+    for (e = 0; (e | 0) < (count | 0); e = (e + 5) | 0) {
+      at = (2097152 + (e << 2)) | 0;
+      code = H32[at >> 2] | 0;
+      k = H32[(at + 8) >> 2] | 0;
+      if (((o + 128) | 0) > (oend | 0)) o = flush(o | 0) | 0;
+      j = o;
+      o = text(o, code) | 0;
+      if ((e | 0) == 0) H8[j >> 0] = 91; // the list's [ where a later error has its comma
+      o = num(H32[(at + 4) >> 2] | 0, o) | 0;
+      o = text(o, 5) | 0;
+      if ((header | 0) == 0) o = num(k, o) | 0;
+      else if ((k | 0) > 0) o = num((k - 1) | 0, o) | 0;
+      else o = text(o, 6) | 0;
+      if ((code | 0) == 3) {
+        o = text(o, 7) | 0;
+        o = num(H32[(at + 12) >> 2] | 0, o) | 0;
+      } else if ((code | 0) == 4) {
+        o = text(o, 8) | 0;
+        from = (3145728 + (H32[(at + 12) >> 2] | 0)) | 0;
+        len = H32[(at + 16) >> 2] | 0;
+        if (((o + len + 8) | 0) > (oend | 0)) {
+          o = flush(o | 0) | 0;
+          if (((o + len + 8) | 0) > (oend | 0)) {
+            H32[11] = 1;
+            break;
+          }
+        }
+        for (j = 0; (j | 0) < (len | 0); j = (j + 1) | 0) H8[(o + j) >> 0] = H8[(from + j) >> 0] | 0;
+        o = (o + len) | 0;
+        H8[o >> 0] = 93;
+        o = (o + 1) | 0;
+      }
+      H8[o >> 0] = 125;
+      o = (o + 1) | 0;
+    }
+    H8[o >> 0] = 93;
+    H32[1] = (o + 1) | 0;
+  }
+
+  return { readText: readText, putErrors: putErrors };
+}
 
 /** The output a case opens with when its header is true (24 bytes), and its form when it is false. */
 const OPEN_HEADER = '{"columns":             ';
 const OPEN_PLAIN = '{"columns":null,"rows":[';
 
-let IFD = -1; // the input and output files; below 0 the input is SRC and the output goes nowhere (prime)
-let OFD = -1;
-let SRC = null;
-let SRCPOS = 0;
-let INP = null; // the input window, CAP bytes and 16 of guard
-let OUT = null; // the output not yet written
-let INPV = null; // the same two as words
-let OUTV = null;
-let OUTB = null; // OUT as a Buffer, for Node's own copies
-let ERR = null; // the case's errors, five numbers each
-let EXT = null; // the case's long rows' cut fields, as JSON
-let CAP = 0;
-let HIGH = 0; // the output is written out past this many bytes
-let END = 0; // the window holds INP[0..END)
-let LIM = 0; // an escape at or past LIM may be cut by the window's end
-let EOF = false;
-let I = 0; // the next input byte
-let O = 0; // the next output byte
-let FLUSHED = 0; // the file offset of OUT[0]
-let AFTER = 0; // the file offset of what follows the case's first record
-let LINE = 1;
-let NREC = 0; // the case's records so far
-let WIDTH = -1;
-let NERR = 0;
-let NEXT = 0;
+/**
+ * The ready-made texts of an error, by number: how each code's error opens (a comma, which the first error's [
+ * replaces, and up to its line), then what stands before its row, a null row, a short row's fields and a long row's
+ * cut fields.
+ */
+const TEXTS = [
+  ',{"code":"stray_cr","line":',
+  ',{"code":"quote_junk","line":',
+  ',{"code":"unterminated_quote","line":',
+  ',{"code":"short_row","line":',
+  ',{"code":"long_row","line":',
+  ',"row":',
+  'null',
+  ',"fields":',
+  ',"extra":[',
+];
 
-/** Writes all of OUT but its last byte, which a case's end may still change. */
+let IFD = -1; // the input and output files
+let OFD = -1;
+let H = null; // the ArrayBuffer as bytes (a Buffer, for Node's own copies) and as 32-bit numbers
+let S = null;
+let READ = null; // Records' readText and putErrors over it
+let ERRORS = null;
+let CAP = 0; // the window's size now
+let EOF = false;
+let FLUSHED = 0; // the file offset of the output's first byte in memory
+let AFTER = 0; // the file offset of what follows the case's first record
+
+/** Writes the output out up to offset o, but for its last byte, which a case's end may still change. */
 function flush(o) {
-  const n = o - 1;
-  if (OFD >= 0) {
-    let done = 0;
-    while (done < n) done += writeSync(OFD, OUT, done, n - done);
-  }
-  OUT[0] = OUT[n];
+  const n = o - 1 - OB;
+  let done = 0;
+  while (done < n) done += writeSync(OFD, H, OB + done, n - done);
+  H[OB] = H[o - 1];
   FLUSHED += n;
-  return 1;
+  return OB + 1;
 }
 
-function pushErr(code, line, k, a, b) {
-  if (NERR + 5 > ERR.length) {
-    const bigger = new Int32Array(ERR.length * 2);
-    bigger.set(ERR);
-    ERR = bigger;
-  }
-  ERR[NERR] = code;
-  ERR[NERR + 1] = line;
-  ERR[NERR + 2] = k;
-  ERR[NERR + 3] = a;
-  ERR[NERR + 4] = b;
-  NERR += 5;
+/** The case's first record ends at output offset o. */
+function first(o) {
+  AFTER = FLUSHED + (o - OB);
 }
 
 /** Room for n more output bytes. */
 function room(n) {
-  if (O + n <= OUT.length) return;
-  O = flush(O);
-  if (O + n <= OUT.length) return;
-  const bigger = new Uint8Array((O + n) * 2);
-  bigger.set(OUT.subarray(0, O));
-  OUT = bigger;
-  OUTV = new DataView(OUT.buffer);
-  OUTB = Buffer.from(OUT.buffer);
+  if (S[S_O] + n <= OEND) return;
+  S[S_O] = flush(S[S_O]);
+  if (S[S_O] + n > OEND) throw new RangeError('no room');
 }
 
-/** Moves INP[keep..END) to the window's start and reads on. False when the file has nothing more to give. */
+/** Moves the window's bytes from `keep` on to its start and reads on. False when there is nothing more to read. */
 function refill(keep) {
   if (EOF) return false;
-  const tail = END - keep;
-  if (keep > 0) {
-    INP.copyWithin(0, keep, END);
-    I -= keep;
+  const tail = S[S_END] - keep;
+  if (keep > IB) {
+    H.copyWithin(IB, keep, S[S_END]);
+    S[S_I] -= keep - IB;
   }
   if (tail === CAP) {
-    // one record fills the window: a wider one, and output room to match
-    CAP *= 2;
-    const wider = new Uint8Array(CAP + 16);
-    wider.set(INP.subarray(0, tail));
-    INP = wider;
-    INPV = new DataView(INP.buffer);
-    const out = new Uint8Array(HIGH + 3 * CAP + 64);
-    out.set(OUT.subarray(0, O));
-    OUT = out;
-    OUTV = new DataView(OUT.buffer);
-    OUTB = Buffer.from(OUT.buffer);
+    if (CAP === MAXCAP) return false; // one record wider than the widest window: run() answers the file
+    CAP = Math.min(CAP * 2, MAXCAP);
   }
-  let n = 0;
-  if (IFD >= 0) n = readSync(IFD, INP, tail, CAP - tail, null);
-  else {
-    n = Math.min(CAP - tail, SRC.length - SRCPOS);
-    INP.set(SRC.subarray(SRCPOS, SRCPOS + n), tail);
-    SRCPOS += n;
-  }
+  const n = readSync(IFD, H, IB + tail, CAP - tail, null);
   if (n === 0) EOF = true;
-  END = tail + n;
-  LIM = EOF ? END : END - 8;
-  INP.fill(34, END, END + 16);
+  const end = IB + tail + n;
+  S[S_END] = end;
+  S[S_LIM] = EOF ? end : end - 8;
+  H.fill(34, end, end + 16);
   return true;
 }
 
-/**
- * The rest of an unquoted field from INP[I] on, with everything rare in it: a stray CR, a literal quote, and at
- * `junk` (when it is not below 0) the output offset where the characters after a closing quote begin. How it ended:
- * 1 at a comma, 2 at a line break (both read), 3 at the text's end (not read), 4 at the window's end, 5 at a byte
- * this reader does not read.
- */
-function rest(recLine, k, junk) {
-  const a = INP;
-  const b = OUT;
-  const end = END;
-  const lim = LIM;
-  let i = I;
-  let o = O;
-  let t = 0;
-  for (;;) {
-    const c = a[i];
-    if (c === 44) {
-      i++;
-      t = 1;
-      break;
-    }
-    if (c === 92) {
-      if (i >= lim) {
-        t = 4;
-        break;
-      }
-      const d = a[i + 1];
-      if (d === 110) {
-        i += 2;
-        t = 2;
-        break;
-      }
-      if (d === 114) {
-        if (a[i + 2] === 92 && a[i + 3] === 110) {
-          i += 4;
-          t = 2;
-          break;
-        }
-        pushErr(E_STRAY_CR, recLine, k, 0, 0);
-        i += 2;
-        continue;
-      }
-      if (d === 34) {
-        b[o] = 92;
-        b[o + 1] = 34;
-        o += 2;
-        i += 2;
-        continue;
-      }
-      t = 5;
-      break;
-    }
-    if (c === 34) {
-      t = i >= end ? 4 : 3;
-      break;
-    }
-    b[o++] = c;
-    i++;
-  }
-  if (t < 4 && junk >= 0 && o > junk) pushErr(E_QUOTE_JUNK, recLine, k, 0, 0);
-  I = i;
-  O = o;
-  return t;
-}
-
-/**
- * The end of a record that is not a row of the case's width with two fields or more: the first record, a short or a
- * long row, a record of one field, a line that held stray CRs alone. OUT holds it from `ro` as [ "..." , "..." with
- * its last quote written; `ri` is where it began in INP.
- */
-function odd(nf, ri, ro, recLine) {
-  let o = O;
-  const total = nf + 1;
-  if (nf === 0 && o === ro + 3 && !(INP[ri] === 92 && INP[ri + 1] === 34)) {
-    O = ro; // no characters and no quotes: no record
-    return;
-  }
-  if (WIDTH < 0) {
-    WIDTH = total;
-    NREC = 1;
-    OUT[o++] = 93;
-    AFTER = FLUSHED + o;
-    O = o;
-    put(',"rows":[');
-    return;
-  }
-  if (total < WIDTH) {
-    pushErr(E_SHORT, recLine, NREC, total, 0);
-    room(3 * (WIDTH - total) + 8);
-    o = O;
-    for (let k = total; k < WIDTH; k++) {
-      OUT[o] = 44;
-      OUT[o + 1] = 34;
-      OUT[o + 2] = 34;
-      o += 3;
-    }
-  } else if (total > WIDTH) {
-    // the comma after the last field kept: WIDTH strings on from the record's first quote
-    const b = OUT;
-    let p = ro + 1;
-    for (let k = 0; k < WIDTH; k++) {
-      p++;
-      for (;;) {
-        const c = b[p];
-        if (c === 34) break;
-        p += c === 92 ? 2 : 1;
-      }
-      p += 2;
-    }
-    p--;
-    const len = o - p - 1;
-    if (NEXT + len > EXT.length) {
-      const bigger = Buffer.allocUnsafe((NEXT + len) * 2);
-      EXT.copy(bigger, 0, 0, NEXT);
-      EXT = bigger;
-    }
-    OUTB.copy(EXT, NEXT, p + 1, o);
-    pushErr(E_LONG, recLine, NREC, NEXT, len);
-    NEXT += len;
-    o = p;
-  }
-  OUT[o] = 93;
-  OUT[o + 1] = 44;
-  O = o + 2;
-  NREC++;
-}
-
-/**
- * Reads the text's records from INP[I] on, writing each as a JSON array. 0: the text ended (I is past its closing
- * quote); 1: the window ended inside a record (I is back at the record's start); 2: a byte this reader does not
- * read; 3: the output moved to a wider array (call again).
- */
-function readText() {
-  const a = INP;
-  const b = OUT;
-  const av = INPV;
-  const bv = OUTV;
-  const end = END;
-  const lim = LIM;
-  const high = HIGH;
-  let i = I;
-  let o = O;
-  let line = LINE;
-  let nrec = NREC;
-  let width = WIDTH;
-  let st = 0;
-  let ri = i;
-  let ro = o;
-  let rline = line;
-  let rnerr = NERR;
-  let rnext = NEXT;
-  let c = 0;
-  let d = 0;
-  let nf = 0;
-  let t = 0;
-  let w = 0; // four input bytes as one word
-  let x = 0;
-  let y = 0;
-  let z = 0;
-  let m = 0; // a word with bit 7 of a byte set where the input word holds a byte that stops the copy
-  let k = 0; // how many of the four bytes come before the first that stops it
-  let base = 0;
-
-  rec: for (;;) {
-    // a record starts here: what a window's end takes the reader back to
-    if (o > high) o = flush(o);
-    ri = i;
-    ro = o;
-    rline = line;
-    rnerr = NERR;
-    rnext = NEXT;
-
-    // (a line with no characters, and the text's end, read as a record of one empty field, which odd drops)
-    b[o] = 91;
-    b[o + 1] = 34;
-    o += 2;
-    nf = 0;
-    for (;;) {
-      // A plain stretch: field bytes and commas up to the next backslash or quote, four bytes at a time. Each
-      // turn copies a whole word; when none of its bytes is a comma, a backslash or a quote it moves on by
-      // four, else by the bytes before the first of them (m marks them: the zero bytes of the word XORed with
-      // each, found the usual way; only its lowest mark is used, which is always a true one) and, when that
-      // is a comma, writes "," and goes on. The bytes written past o are rewritten by what follows. Every
-      // comma moves the output two bytes further than the input: that counts them.
-      base = o - i;
-      for (;;) {
-        w = av.getInt32(i, true);
-        x = w ^ 0x2c2c2c2c;
-        y = w ^ 0x5c5c5c5c;
-        z = w ^ 0x22222222;
-        m = (((x - 0x01010101) & ~x) | ((y - 0x01010101) & ~y) | ((z - 0x01010101) & ~z)) & 0x80808080;
-        bv.setInt32(o, w, true);
-        if (m === 0) {
-          i += 4;
-          o += 4;
-          continue;
-        }
-        k = (31 - Math.clz32(m & -m)) >> 3;
-        i += k;
-        o += k;
-        c = a[i];
-        if (c !== 44) break;
-        bv.setInt32(o, 0x222c22, true);
-        o += 3;
-        i++;
-      }
-      nf += (o - i - base) >> 1;
-      if (c === 34) {
-        if (i >= end) {
-          st = 1;
-          break rec;
-        }
-        t = 3;
-        break;
-      }
-      if (i >= lim) {
-        st = 1;
-        break rec;
-      }
-      d = a[i + 1];
-      if (d === 110) {
-        i += 2;
-        t = 2;
-        break;
-      }
-      if (d === 114 && a[i + 2] === 92 && a[i + 3] === 110) {
-        i += 4;
-        t = 2;
-        break;
-      }
-      if (d === 34 && (i === ri || a[i - 1] === 44)) {
-        // a quote where a field starts: a quoted field, copied up to a backslash or a quote (a byte at a time:
-        // a second word loop costs more to compile than it saves on the few bytes that are quoted)
-        const qi = i;
-        const qo = o;
-        const qline = line;
-        i += 2;
-        for (;;) {
-          c = a[i];
-          while (c !== 92 && c !== 34) {
-            b[o++] = c;
-            c = a[++i];
-          }
-          if (c === 34) {
-            if (i >= end) {
-              st = 1;
-              break rec;
-            }
-            // the text ends inside the quotes: the quote is a character, and the field is read again from it
-            i = qi + 2;
-            o = qo;
-            line = qline;
-            pushErr(E_UNTERMINATED, rline, nrec, 0, 0);
-            b[o] = 92;
-            b[o + 1] = 34;
-            I = i;
-            O = o + 2;
-            t = rest(rline, nrec, -1);
-            i = I;
-            o = O;
-            break;
-          }
-          if (i >= lim) {
-            st = 1;
-            break rec;
-          }
-          d = a[i + 1];
-          if (d === 34) {
-            if (a[i + 2] === 92 && a[i + 3] === 34) {
-              b[o] = 92;
-              b[o + 1] = 34;
-              o += 2;
-              i += 4;
-              continue;
-            }
-            // the closing quote
-            i += 2;
-            c = a[i];
-            if (c === 44) {
-              i++;
-              t = 1;
-              break;
-            }
-            if (c === 92) {
-              if (i >= lim) {
-                st = 1;
-                break rec;
-              }
-              d = a[i + 1];
-              if (d === 110) {
-                i += 2;
-                t = 2;
-                break;
-              }
-              if (d === 114 && a[i + 2] === 92 && a[i + 3] === 110) {
-                i += 4;
-                t = 2;
-                break;
-              }
-            } else if (c === 34) {
-              if (i >= end) {
-                st = 1;
-                break rec;
-              }
-              t = 3;
-              break;
-            }
-            I = i;
-            O = o;
-            t = rest(rline, nrec, o);
-            i = I;
-            o = O;
-            break;
-          }
-          if (d === 110) {
-            b[o] = 92;
-            b[o + 1] = 110;
-            o += 2;
-            i += 2;
-            line++;
-            continue;
-          }
-          if (d === 114) {
-            b[o] = 92;
-            b[o + 1] = 110;
-            o += 2;
-            i += a[i + 2] === 92 && a[i + 3] === 110 ? 4 : 2;
-            line++;
-            continue;
-          }
-          st = 2;
-          break rec;
-        }
-      } else {
-        // a stray CR, a quote inside a field, or a byte this reader does not read
-        I = i;
-        O = o;
-        t = rest(rline, nrec, -1);
-        i = I;
-        o = O;
-      }
-      if (t !== 1) break;
-      b[o] = 34;
-      b[o + 1] = 44;
-      b[o + 2] = 34;
-      o += 3;
-      nf++;
-    }
-    if (t > 3) {
-      st = t - 3;
-      break;
-    }
-    b[o++] = 34;
-    if (t === 2) line++;
-    if (nf + 1 === width && nf !== 0) {
-      b[o] = 93;
-      b[o + 1] = 44;
-      o += 2;
-      nrec++;
-    } else {
-      O = o;
-      NREC = nrec;
-      WIDTH = width;
-      odd(nf, ri, ro, rline);
-      o = O;
-      nrec = NREC;
-      width = WIDTH;
-      if (OUT !== b) {
-        st = 3;
-        break;
-      }
-    }
-    if (t === 3) {
-      i++; // the quote that ends the text
-      break;
-    }
-  }
-
-  if (st === 0 || st === 3) {
-    I = i;
-    O = o;
-    LINE = line;
-  } else {
-    I = ri;
-    O = ro;
-    LINE = rline;
-    NERR = rnerr;
-    NEXT = rnext;
-  }
-  NREC = nrec;
-  WIDTH = width;
-  return st;
-}
-
-/** Whether INP holds `s` at I; moves past it when it does. */
+/** Whether the window holds `s` at the next input byte; moves past it when it does. */
 function match(s) {
   const n = s.length;
-  for (let k = 0; k < n; k++) if (INP[I + k] !== s.charCodeAt(k)) return false;
-  I += n;
+  const i = S[S_I];
+  for (let k = 0; k < n; k++) if (H[i + k] !== s.charCodeAt(k)) return false;
+  S[S_I] = i + n;
   return true;
 }
 
-/** At least n bytes in the window from I on, or all the file has left. */
+/** At least n bytes in the window from the next input byte on, or all the file has left. */
 function ensure(n) {
-  while (END - I < n && refill(I));
+  while (S[S_END] - S[S_I] < n && refill(S[S_I]));
 }
 
 /** Writes `s` (ASCII) over the output at file offset `at`, written out already or not. */
 function patch(at, s) {
   for (let k = 0; k < s.length; k++) {
     const p = at + k - FLUSHED;
-    if (p >= 0) OUT[p] = s.charCodeAt(k);
+    if (p >= 0) H[OB + p] = s.charCodeAt(k);
   }
-  if (at < FLUSHED && OFD >= 0) {
+  if (at < FLUSHED) {
     const n = Math.min(s.length, FLUSHED - at);
     writeSync(OFD, Buffer.from(s.slice(0, n), 'latin1'), 0, n, at);
   }
@@ -558,66 +718,9 @@ function patch(at, s) {
 function put(s) {
   const n = s.length;
   room(n);
-  if (n < 16) for (let k = 0; k < n; k++) OUT[O + k] = s.charCodeAt(k);
-  else OUTB.latin1Write(s, O, n);
-  O += n;
-}
-
-/** Writes v, a whole number of 0 or more, in decimal at OUT[o]; the offset after it. */
-function putNumber(v, o) {
-  if (v < 10) {
-    OUT[o] = 48 + v;
-    return o + 1;
-  }
-  let n = 2;
-  for (let p = 100; p <= v; p *= 10) n++;
-  for (let q = o + n - 1; q >= o; q--) {
-    OUT[q] = 48 + (v % 10);
-    v = (v / 10) | 0;
-  }
-  return o + n;
-}
-
-/**
- * Writes the case's errors, comma-separated, as bytes: each from its code's ready-made opening, its numbers digit by
- * digit, a long row's cut fields as they were kept. No string is built: thousands of them would be garbage to collect.
- */
-function putErrors(header) {
-  if (NERR === 0) put('[');
-  for (let e = 0; e < NERR; e += 5) {
-    const code = ERR[e];
-    const k = ERR[e + 2];
-    room(128);
-    let o = O;
-    const open = ERR_OPEN[code];
-    OUT.set(open, o);
-    if (e === 0) OUT[o] = 91; // the list's [ where a later error has its comma
-    o = putNumber(ERR[e + 1], o + open.length);
-    OUT.set(ERR_ROW, o);
-    o += 7;
-    if (!header) o = putNumber(k, o);
-    else if (k > 0) o = putNumber(k - 1, o);
-    else {
-      OUT.set(ERR_NULL, o);
-      o += 4;
-    }
-    if (code === E_SHORT) {
-      OUT.set(ERR_FIELDS, o);
-      o = putNumber(ERR[e + 3], o + 10);
-    } else if (code === E_LONG) {
-      OUT.set(ERR_EXTRA, o);
-      O = o + 10;
-      const at = ERR[e + 3];
-      const len = ERR[e + 4];
-      room(len + 2);
-      o = O;
-      EXT.copy(OUT, o, at, at + len);
-      o += len;
-      OUT[o++] = 93;
-    }
-    OUT[o] = 125;
-    O = o + 1;
-  }
+  const o = S[S_O];
+  for (let k = 0; k < n; k++) H[o + k] = s.charCodeAt(k);
+  S[S_O] = o + n;
 }
 
 /**
@@ -625,55 +728,66 @@ function putErrors(header) {
  * does not read (nothing it wrote counts then).
  */
 function transduce(cap) {
-  CAP = cap;
-  HIGH = cap;
-  INP = new Uint8Array(CAP + 16);
-  OUT = new Uint8Array(HIGH + 3 * CAP + 64);
-  INPV = new DataView(INP.buffer);
-  OUTV = new DataView(OUT.buffer);
-  OUTB = Buffer.from(OUT.buffer);
-  ERR = new Int32Array(5 * 4096);
-  EXT = Buffer.allocUnsafe(1 << 16);
-  END = 0;
+  if (H === null) {
+    const heap = new ArrayBuffer(HEAP_BYTES);
+    H = Buffer.from(heap);
+    S = new Int32Array(heap);
+    let at = TB + 8 * TEXTS.length;
+    for (let t = 0; t < TEXTS.length; t++) {
+      S[(TB >> 2) + 2 * t] = at;
+      S[(TB >> 2) + 2 * t + 1] = TEXTS[t].length;
+      at += H.latin1Write(TEXTS[t], at);
+    }
+    const records = Records(globalThis, { flush, first }, heap);
+    READ = records.readText;
+    ERRORS = records.putErrors;
+  }
+  CAP = Math.min(cap, MAXCAP);
   EOF = false;
-  I = 0;
-  O = 0;
   FLUSHED = 0;
-  refill(0);
+  S[S_I] = IB;
+  S[S_END] = IB;
+  S[S_O] = OB;
+  S[S_HIGH] = OB + CAP;
+  S[S_OEND] = OEND;
+  S[S_BAD] = 0;
+  refill(IB);
   ensure(2);
-  if (INP[I] !== 91) return false;
-  I++;
-  OUT[O++] = 91;
-  if (INP[I] === 93) {
-    I++;
+  if (H[S[S_I]] !== 91) return false;
+  S[S_I]++;
+  H[S[S_O]++] = 91;
+  if (H[S[S_I]] === 93) {
+    S[S_I]++;
   } else {
     for (;;) {
       ensure(128);
       if (!match('{"id":"')) return false;
+      let i = S[S_I];
       for (;;) {
-        const c = INP[I];
+        const c = H[i];
         if (c === 34) break;
         if (c === 92 || c < 32) return false;
-        I++;
+        i++;
       }
-      if (I >= END) return false;
-      I++;
+      if (i >= S[S_END]) return false;
+      S[S_I] = i + 1;
       if (!match(',"input":{"text":"')) return false;
       ensure(8);
-      if (INP[I] === 0xef && INP[I + 1] === 0xbb && INP[I + 2] === 0xbf) I += 3;
+      i = S[S_I];
+      if (H[i] === 0xef && H[i + 1] === 0xbb && H[i + 2] === 0xbf) S[S_I] = i + 3;
 
-      const opened = FLUSHED + O;
+      const opened = FLUSHED + (S[S_O] - OB);
       put(OPEN_HEADER);
-      LINE = 1;
-      NREC = 0;
-      WIDTH = -1;
-      NERR = 0;
-      NEXT = 0;
+      S[S_LINE] = 1;
+      S[S_NREC] = 0;
+      S[S_WIDTH] = -1;
+      S[S_NERR] = 0;
+      S[S_NEXT] = 0;
       for (;;) {
-        const st = readText();
+        const st = READ();
         if (st === 0) break;
         if (st === 2) return false;
-        if (st === 1 && !refill(I)) return false;
+        if (!refill(S[S_I])) return false;
       }
 
       ensure(24);
@@ -683,27 +797,30 @@ function transduce(cap) {
       else if (match('false}}')) header = false;
       else return false;
 
+      const nrec = S[S_NREC];
       if (header) {
-        if (NREC === 0) put('[],"rows":[]');
-        else if (NREC === 1) put(']');
-        else OUT[O - 1] = 93;
+        if (nrec === 0) put('[],"rows":[]');
+        else if (nrec === 1) put(']');
+        else H[S[S_O] - 1] = 93;
       } else {
         patch(opened, OPEN_PLAIN);
-        if (NREC === 0) put(']');
-        else if (NREC === 1) {
+        if (nrec === 0) put(']');
+        else if (nrec === 1) {
           patch(AFTER, '         ');
           put(']');
         } else {
           patch(AFTER, ',        ');
-          OUT[O - 1] = 93;
+          H[S[S_O] - 1] = 93;
         }
       }
       put(',"errors":');
-      putErrors(header);
-      put(']}');
+      room(16);
+      ERRORS(header ? 1 : 0);
+      if (S[S_BAD] !== 0) return false;
+      put('}');
 
       ensure(2);
-      const c = INP[I++];
+      const c = H[S[S_I]++];
       if (c === 44) {
         put(',');
         continue;
@@ -713,83 +830,21 @@ function transduce(cap) {
     }
   }
   ensure(1);
-  if (I < END || !EOF) return false;
+  if (S[S_I] < S[S_END] || !EOF) return false;
   room(1);
-  OUT[O++] = 93;
-  if (OFD >= 0) {
-    let done = 0;
-    while (done < O) done += writeSync(OFD, OUT, done, O - done);
-  }
+  H[S[S_O]++] = 93;
+  const n = S[S_O] - OB;
+  let done = 0;
+  while (done < n) done += writeSync(OFD, H, OB + done, n - done);
   return true;
 }
 
-/** Made-up cases that between them take the reader through every branch it has. */
-function primer() {
-  const q = '\\"';
-  const rows = [];
-  for (let r = 1; r < 5; r++) {
-    const eol = r % 3 === 0 ? '\\n' : '\\r\\n';
-    rows.push(`${r},alpha beta,2020-01-0${r},AB-12${r},${q}say ${q}${q}hi${q}${q}, you${q},x${eol}`);
-    rows.push(`${r},Zürich 東京,${q}two${eol}lines\\rmore${q},CD-9,${q}plain${q},y${eol}`);
-    if (r % 5 === 1) rows.push(`1,short${eol}`);
-    if (r % 5 === 2) rows.push(`1,2,3,4,5,6,long,${q}lo,ng${q},er${eol}`);
-    if (r % 5 === 3) rows.push(`1,a\\rb,${q}q${q}kg,${q}q${q}\\r,x${q}y,${q}z${q}${eol}${eol}\\r${eol}`);
-    if (r % 5 === 4) rows.push(`${q}e${q}${eol}${q}${q},${q}${q}${eol}${q}f${q}`);
-  }
-  const body = rows.join('');
-  const head = 'a,b,c,d,e,f\\n';
-  const cases = [
-    `{"id":"g-0001","input":{"text":"﻿${head}${body}","header":true}}`,
-    `{"id":"g-0002","input":{"text":"${body}\\n${q}open,1,2\\n3,4","header":false}}`,
-    `{"id":"g-0003","input":{"text":"","header":true}}`,
-    `{"id":"g-0004","input":{"text":"one\\n","header":false}}`,
-    `{"id":"g-0005","input":{"text":"${head}${body}${q}never,closed${q}${q}","header":true}}`,
-    `{"id":"g-0006","input":{"text":"\\r\\n\\r","header":false}}`,
-  ];
-  return Buffer.from('[' + cases.join(',') + ']', 'utf8');
-}
-
-let PRIMED = false;
-
-/**
- * V8's flags for this program (the rules allow an entry to tune them): every function keeps its type feedback from
- * its first call, so the primer's one pass is enough; only readText is ever compiled by the optimizing compiler,
- * with nothing inlined into it (a helper's branch the primer cannot take, such as a real write, would otherwise
- * undo the compiled code when the file takes it).
- */
-const FLAGS = ['--no-lazy-feedback-allocation', '--turbo-filter=readText', '--no-turbo-inlining', '--allow-natives-syntax'];
-
-/** Runs the reader over the primer, then has V8 compile readText before its next call. */
-function prime() {
-  PRIMED = true;
-  let v8;
-  try {
-    // V8's flag setter straight from Node's binding: loading node:v8 for it costs over a millisecond
-    process.noDeprecation = true;
-    v8 = process.binding('v8');
-    if (typeof v8.setFlagsFromString !== 'function') v8 = require('node:v8');
-  } catch {
-    v8 = require('node:v8');
-  }
-  for (const f of FLAGS) v8.setFlagsFromString(f);
+/** Answers every case of the file at inPath into outPath. True when the byte reader did, false when run() had to. */
+function answerFile(inPath, outPath, cap = MAXCAP, close = true) {
+  let ok = false;
   IFD = -1;
   OFD = -1;
-  SRC = primer();
-  SRCPOS = 0;
-  transduce(256);
-  SRC = null;
   try {
-    new Function('f', '%OptimizeFunctionOnNextCall(f)')(readText);
-  } catch {
-    // no such syntax in this V8: readText is compiled when V8 finds it hot
-  }
-}
-
-/** Answers every case of the file at inPath into outPath. True when the byte reader did, false when run() had to. */
-function answerFile(inPath, outPath, cap = 1 << 18, close = true) {
-  let ok = false;
-  try {
-    if (!PRIMED) prime();
     IFD = openSync(inPath, 'r');
     OFD = openSync(outPath, 'w');
     ok = transduce(cap);
@@ -799,8 +854,6 @@ function answerFile(inPath, outPath, cap = 1 << 18, close = true) {
   if (ok && !close) return true; // the program's own run: the files close as it exits
   if (IFD >= 0) closeSync(IFD);
   if (OFD >= 0) closeSync(OFD);
-  IFD = -1;
-  OFD = -1;
   if (ok) return true;
   // the plain way: every case answered alone by solve.js's run()
   const { run } = require('./solve.js');
@@ -813,7 +866,7 @@ function answerFile(inPath, outPath, cap = 1 << 18, close = true) {
 
 /** The program: /input/cases.json to /output/answers.json (MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in). */
 function main() {
-  answerFile((process.env.MAKEFUN_INPUT_DIR ?? '/input') + '/cases.json', (process.env.MAKEFUN_OUTPUT_DIR ?? '/output') + '/answers.json', 1 << 18, false);
+  answerFile((process.env.MAKEFUN_INPUT_DIR ?? '/input') + '/cases.json', (process.env.MAKEFUN_OUTPUT_DIR ?? '/output') + '/answers.json', MAXCAP, false);
 }
 
 module.exports = { answerFile, main };
