@@ -25,7 +25,12 @@ const E_QUOTE_JUNK = 1;
 const E_UNTERMINATED = 2;
 const E_SHORT = 3;
 const E_LONG = 4;
-const CODES = ['stray_cr', 'quote_junk', 'unterminated_quote', 'short_row', 'long_row'];
+/** How each error opens in the answer, by its code, as bytes: a comma (the first error's is cut) and up to its line. */
+const ERR_OPEN = ['stray_cr', 'quote_junk', 'unterminated_quote', 'short_row', 'long_row'].map((code) => Buffer.from(`,{"code":"${code}","line":`, 'latin1'));
+const ERR_ROW = Buffer.from(',"row":', 'latin1');
+const ERR_NULL = Buffer.from('null', 'latin1');
+const ERR_FIELDS = Buffer.from(',"fields":', 'latin1');
+const ERR_EXTRA = Buffer.from(',"extra":[', 'latin1');
 
 /** The output a case opens with when its header is true (24 bytes), and its form when it is false. */
 const OPEN_HEADER = '{"columns":             ';
@@ -39,6 +44,7 @@ let INP = null; // the input window, CAP bytes and 16 of guard
 let OUT = null; // the output not yet written
 let INPV = null; // the same two as words
 let OUTV = null;
+let OUTB = null; // OUT as a Buffer, for Node's own copies
 let ERR = null; // the case's errors, five numbers each
 let EXT = null; // the case's long rows' cut fields, as JSON
 let CAP = 0;
@@ -91,6 +97,7 @@ function room(n) {
   bigger.set(OUT.subarray(0, O));
   OUT = bigger;
   OUTV = new DataView(OUT.buffer);
+  OUTB = Buffer.from(OUT.buffer);
 }
 
 /** Moves INP[keep..END) to the window's start and reads on. False when the file has nothing more to give. */
@@ -112,6 +119,7 @@ function refill(keep) {
     out.set(OUT.subarray(0, O));
     OUT = out;
     OUTV = new DataView(OUT.buffer);
+    OUTB = Buffer.from(OUT.buffer);
   }
   let n = 0;
   if (IFD >= 0) n = readSync(IFD, INP, tail, CAP - tail, null);
@@ -239,11 +247,11 @@ function odd(nf, ri, ro, recLine) {
     p--;
     const len = o - p - 1;
     if (NEXT + len > EXT.length) {
-      const bigger = new Uint8Array((NEXT + len) * 2);
-      bigger.set(EXT.subarray(0, NEXT));
+      const bigger = Buffer.allocUnsafe((NEXT + len) * 2);
+      EXT.copy(bigger, 0, 0, NEXT);
       EXT = bigger;
     }
-    EXT.set(b.subarray(p + 1, o), NEXT);
+    OUTB.copy(EXT, NEXT, p + 1, o);
     pushErr(E_LONG, recLine, NREC, NEXT, len);
     NEXT += len;
     o = p;
@@ -299,32 +307,7 @@ function readText() {
     rnerr = NERR;
     rnext = NEXT;
 
-    c = a[i];
-    if (c === 92) {
-      if (i >= lim) {
-        st = 1;
-        break;
-      }
-      d = a[i + 1];
-      if (d === 110) {
-        i += 2;
-        line++;
-        continue;
-      }
-      if (d === 114 && a[i + 2] === 92 && a[i + 3] === 110) {
-        i += 4;
-        line++;
-        continue;
-      }
-    } else if (c === 34) {
-      if (i >= end) {
-        st = 1;
-        break;
-      }
-      i++;
-      break;
-    }
-
+    // (a line with no characters, and the text's end, read as a record of one empty field, which odd drops)
     b[o] = 91;
     b[o + 1] = 34;
     o += 2;
@@ -511,17 +494,21 @@ function readText() {
       b[o + 1] = 44;
       o += 2;
       nrec++;
-      continue;
+    } else {
+      O = o;
+      NREC = nrec;
+      WIDTH = width;
+      odd(nf, ri, ro, rline);
+      o = O;
+      nrec = NREC;
+      width = WIDTH;
+      if (OUT !== b) {
+        st = 3;
+        break;
+      }
     }
-    O = o;
-    NREC = nrec;
-    WIDTH = width;
-    odd(nf, ri, ro, rline);
-    o = O;
-    nrec = NREC;
-    width = WIDTH;
-    if (OUT !== b) {
-      st = 3;
+    if (t === 3) {
+      i++; // the quote that ends the text
       break;
     }
   }
@@ -572,8 +559,65 @@ function put(s) {
   const n = s.length;
   room(n);
   if (n < 16) for (let k = 0; k < n; k++) OUT[O + k] = s.charCodeAt(k);
-  else Buffer.from(OUT.buffer).latin1Write(s, O, n);
+  else OUTB.latin1Write(s, O, n);
   O += n;
+}
+
+/** Writes v, a whole number of 0 or more, in decimal at OUT[o]; the offset after it. */
+function putNumber(v, o) {
+  if (v < 10) {
+    OUT[o] = 48 + v;
+    return o + 1;
+  }
+  let n = 2;
+  for (let p = 100; p <= v; p *= 10) n++;
+  for (let q = o + n - 1; q >= o; q--) {
+    OUT[q] = 48 + (v % 10);
+    v = (v / 10) | 0;
+  }
+  return o + n;
+}
+
+/**
+ * Writes the case's errors, comma-separated, as bytes: each from its code's ready-made opening, its numbers digit by
+ * digit, a long row's cut fields as they were kept. No string is built: thousands of them would be garbage to collect.
+ */
+function putErrors(header) {
+  if (NERR === 0) put('[');
+  for (let e = 0; e < NERR; e += 5) {
+    const code = ERR[e];
+    const k = ERR[e + 2];
+    room(128);
+    let o = O;
+    const open = ERR_OPEN[code];
+    OUT.set(open, o);
+    if (e === 0) OUT[o] = 91; // the list's [ where a later error has its comma
+    o = putNumber(ERR[e + 1], o + open.length);
+    OUT.set(ERR_ROW, o);
+    o += 7;
+    if (!header) o = putNumber(k, o);
+    else if (k > 0) o = putNumber(k - 1, o);
+    else {
+      OUT.set(ERR_NULL, o);
+      o += 4;
+    }
+    if (code === E_SHORT) {
+      OUT.set(ERR_FIELDS, o);
+      o = putNumber(ERR[e + 3], o + 10);
+    } else if (code === E_LONG) {
+      OUT.set(ERR_EXTRA, o);
+      O = o + 10;
+      const at = ERR[e + 3];
+      const len = ERR[e + 4];
+      room(len + 2);
+      o = O;
+      EXT.copy(OUT, o, at, at + len);
+      o += len;
+      OUT[o++] = 93;
+    }
+    OUT[o] = 125;
+    O = o + 1;
+  }
 }
 
 /**
@@ -587,8 +631,9 @@ function transduce(cap) {
   OUT = new Uint8Array(HIGH + 3 * CAP + 64);
   INPV = new DataView(INP.buffer);
   OUTV = new DataView(OUT.buffer);
+  OUTB = Buffer.from(OUT.buffer);
   ERR = new Int32Array(5 * 4096);
-  EXT = new Uint8Array(1 << 16);
+  EXT = Buffer.allocUnsafe(1 << 16);
   END = 0;
   EOF = false;
   I = 0;
@@ -653,25 +698,9 @@ function transduce(cap) {
           OUT[O - 1] = 93;
         }
       }
-      // the errors, as one string as far as they are ASCII: only a long row's cut fields are copied as bytes
-      let s = ',"errors":[';
-      for (let e = 0; e < NERR; e += 5) {
-        const code = ERR[e];
-        const k = ERR[e + 2];
-        const row = header ? (k === 0 ? 'null' : String(k - 1)) : String(k);
-        s += (e > 0 ? ',{"code":"' : '{"code":"') + CODES[code] + '","line":' + ERR[e + 1] + ',"row":' + row;
-        if (code === E_SHORT) s += ',"fields":' + ERR[e + 3] + '}';
-        else if (code === E_LONG) {
-          put(s + ',"extra":[');
-          const at = ERR[e + 3];
-          const len = ERR[e + 4];
-          room(len);
-          OUT.set(EXT.subarray(at, at + len), O);
-          O += len;
-          s = ']}';
-        } else s += '}';
-      }
-      put(s + ']}');
+      put(',"errors":');
+      putErrors(header);
+      put(']}');
 
       ensure(2);
       const c = INP[I++];
