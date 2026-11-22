@@ -19,6 +19,8 @@ const { openSync, closeSync, readSync, writeSync, readFileSync, writeFileSync } 
 // The one ArrayBuffer (4 MiB), by byte offset:
 //        0  sixteen 32-bit numbers, the reader's state (the S_ indexes below)
 //       64  the ready-made texts of an error (TEXTS): for each, where it is and how long, then the texts
+//      512  256 bytes, 1 for each byte that ends a run of plain field bytes: the comma, the backslash, the quote
+//      768  256 bytes, 1 for each byte that ends a run of quoted bytes: the backslash, the quote
 //   IB      the input window: at most MAXCAP bytes of the file and 16 of guard
 //   OB      the output not yet written: HIGH bytes before it is written out, and room for one window's records
 //   EB      the case's errors, five 32-bit numbers each: code, line, record count, and two more for a short row's
@@ -26,7 +28,9 @@ const { openSync, closeSync, readSync, writeSync, readFileSync, writeFileSync } 
 //   XB      the case's long rows' cut fields, as the JSON they were written as
 const HEAP_BYTES = 1 << 22;
 const TB = 64;
-const IB = 512;
+const STOPS = 512;
+const QSTOPS = 768;
+const IB = 1024;
 const MAXCAP = 1 << 18;
 const OB = 1 << 19;
 const OEND = OB + MAXCAP + 3 * MAXCAP + 64;
@@ -305,9 +309,9 @@ function Records(stdlib, foreign, heap) {
       o = (o + 2) | 0;
       nf = 0;
       for (;;) {
-        // plain bytes up to a comma, a backslash or the quote that ends the text
+        // plain bytes up to a comma, a backslash or the quote that ends the text (the table at byte 512 marks them)
         c = H8[i >> 0] | 0;
-        while (((c | 0) != 44) & ((c | 0) != 92) & ((c | 0) != 34)) {
+        while (!(H8[(512 + c) >> 0] | 0)) {
           H8[o >> 0] = c;
           o = (o + 1) | 0;
           i = (i + 1) | 0;
@@ -346,14 +350,14 @@ function Records(stdlib, foreign, heap) {
           break;
         }
         if (((d | 0) == 34) & (((i | 0) == (ri | 0)) | ((H8[(i - 1) >> 0] | 0) == 44))) {
-          // a quote where a field starts: a quoted field, copied up to a backslash or a quote
+          // a quote where a field starts: a quoted field, copied up to a backslash or a quote (the table at 768)
           qi = i;
           qo = o;
           qline = line;
           i = (i + 2) | 0;
           for (;;) {
             c = H8[i >> 0] | 0;
-            while (((c | 0) != 92) & ((c | 0) != 34)) {
+            while (!(H8[(768 + c) >> 0] | 0)) {
               H8[o >> 0] = c;
               o = (o + 1) | 0;
               i = (i + 1) | 0;
@@ -738,6 +742,8 @@ function transduce(cap) {
       S[(TB >> 2) + 2 * t + 1] = TEXTS[t].length;
       at += H.latin1Write(TEXTS[t], at);
     }
+    H[STOPS + 44] = H[STOPS + 92] = H[STOPS + 34] = 1;
+    H[QSTOPS + 92] = H[QSTOPS + 34] = 1;
     const records = Records(globalThis, { flush, first }, heap);
     READ = records.readText;
     ERRORS = records.putErrors;
